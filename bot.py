@@ -5,6 +5,11 @@ Analysiert Fahrzeugfehler (OBD, CAN, FlexRay, Ethernet/DoIP, LIN) per:
 - Text: Hersteller + Modell + Fehlercode(s)
 - Screenshot: OBD-Auslesegerät, Diagnose-Software
 
+Datenquellen:
+- Lokale SAE-DTC-Datenbank (dtc_codes.json)
+- NHTSA API: US-Rückrufe + Kundenbeschwerden (kostenlos)
+- Claude Web Search: TSBs, Foren, herstellerspezifische Codes
+
 Commands:
   /start  — Erklärung
   /reset  — Konversation zurücksetzen (neues Fahrzeug)
@@ -22,6 +27,8 @@ from telegram.constants import ChatAction
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler, filters,
 )
+
+from sources import lookup_dtc, nhtsa_recalls, nhtsa_complaints
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -43,19 +50,57 @@ SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.txt").read_text(encoding
 # ── Client ────────────────────────────────────────────────────────────────────
 claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
-WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
+# ── Tools ─────────────────────────────────────────────────────────────────────
+TOOLS = [
+    {"type": "web_search_20250305", "name": "web_search", "max_uses": 5},
+    {
+        "name": "lookup_dtc",
+        "description": "SAE-Standard Fehlercode (DTC) in lokaler Datenbank nachschlagen. Gibt offizielle Bezeichnung zurück. Immer zuerst aufrufen bevor online gesucht wird.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "DTC-Code z.B. P0300, U0100, B1342, C0035"}
+            },
+            "required": ["code"],
+        },
+    },
+    {
+        "name": "nhtsa_recalls",
+        "description": "NHTSA-Rückrufe (USA) für ein Fahrzeug abrufen. Enthält betroffene Bauteile und Beschreibung.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "make":  {"type": "string",  "description": "Hersteller auf Englisch z.B. BMW, Toyota, Volkswagen"},
+                "model": {"type": "string",  "description": "Modell auf Englisch z.B. '3 Series', 'Corolla', 'Golf'"},
+                "year":  {"type": "integer", "description": "Baujahr z.B. 2021"},
+            },
+            "required": ["make", "model", "year"],
+        },
+    },
+    {
+        "name": "nhtsa_complaints",
+        "description": "NHTSA-Kundenbeschwerden (USA) für ein Fahrzeug abrufen. Zeigt häufigste Problembereiche nach Anzahl.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "make":  {"type": "string",  "description": "Hersteller auf Englisch"},
+                "model": {"type": "string",  "description": "Modell auf Englisch"},
+                "year":  {"type": "integer", "description": "Baujahr"},
+            },
+            "required": ["make", "model", "year"],
+        },
+    },
+]
 
 # ── Konversations-History (pro Chat, in-memory) ───────────────────────────────
 _history: dict[int, list] = {}
-
 CONTEXT_MESSAGES = 20
 
 def _get_history(chat_id: int) -> list:
     return _history.setdefault(chat_id, [])
 
-def _add(chat_id: int, role: str, content) -> None:
-    h = _get_history(chat_id)
-    h.append({"role": role, "content": content})
+def _trim(chat_id: int) -> None:
+    h = _history.get(chat_id, [])
     if len(h) > CONTEXT_MESSAGES:
         _history[chat_id] = h[-CONTEXT_MESSAGES:]
 
@@ -64,20 +109,55 @@ def _extract_text(content) -> str:
         return content
     return "\n".join(b.text for b in content if hasattr(b, "text") and b.text).strip()
 
-# ── Claude ────────────────────────────────────────────────────────────────────
+# ── Tool-Ausführung ────────────────────────────────────────────────────────────
+
+def _run_tool(name: str, inputs: dict) -> str:
+    log.info(f"Tool: {name}({inputs})")
+    if name == "lookup_dtc":
+        return lookup_dtc(inputs["code"])
+    if name == "nhtsa_recalls":
+        return nhtsa_recalls(inputs["make"], inputs["model"], int(inputs["year"]))
+    if name == "nhtsa_complaints":
+        return nhtsa_complaints(inputs["make"], inputs["model"], int(inputs["year"]))
+    return f"Unbekanntes Tool: {name}"
+
+# ── Claude mit Tool-Loop ───────────────────────────────────────────────────────
 
 def get_diagnosis(chat_id: int, user_content) -> str:
-    _add(chat_id, "user", user_content)
-    resp = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2048,
-        system=SYSTEM_PROMPT,
-        tools=[WEB_SEARCH_TOOL],
-        messages=_get_history(chat_id),
-    )
-    reply = _extract_text(resp.content)
-    _add(chat_id, "assistant", reply)
-    return reply
+    h = _get_history(chat_id)
+    h.append({"role": "user", "content": user_content})
+
+    messages = list(h)
+
+    for _ in range(15):  # max 15 Tool-Runden
+        resp = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages,
+        )
+
+        if resp.stop_reason != "tool_use":
+            reply = _extract_text(resp.content)
+            h.append({"role": "assistant", "content": reply})
+            _trim(chat_id)
+            return reply
+
+        # Tool-Calls ausführen
+        messages.append({"role": "assistant", "content": resp.content})
+        results = []
+        for block in resp.content:
+            if block.type == "tool_use":
+                result = _run_tool(block.name, block.input)
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result,
+                })
+        messages.append({"role": "user", "content": results})
+
+    return "⚠️ Analyse konnte nicht abgeschlossen werden (zu viele Tool-Runden)."
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -93,14 +173,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         "🔧 *OBD Diagnose Agent*\n\n"
-        "Schick mir:\n"
-        "• Hersteller + Modell + Fehlercode(s)\n"
-        "  z.B. `BMW 3er G20 2021, P0300, U0100`\n"
-        "• Screenshot deines OBD-Geräts oder der Diagnose-Software\n"
-        "• Beides kombiniert\n\n"
-        "Ich analysiere Fehler aus *OBD-II, CAN, FlexRay, Ethernet/DoIP, LIN* und suche "
-        "online nach TSBs und bekannten Problemen.\n\n"
-        "/reset — Neues Fahrzeug / Gespräch neu starten",
+        "Schick mir Fahrzeug + Fehlercode(s):\n"
+        "`BMW 3er G20 2021, P0300, U0100`\n\n"
+        "Oder einen *Screenshot* deines OBD-Geräts.\n\n"
+        "Ich analysiere Fehler aus OBD-II, CAN, FlexRay, Ethernet/DoIP, LIN und suche:\n"
+        "• SAE-Standarddatenbank (lokal)\n"
+        "• NHTSA Rückrufe & Kundenbeschwerden\n"
+        "• Web (TSBs, Foren, herstellerspezifische Codes)\n\n"
+        "/reset — Neues Fahrzeug",
         parse_mode="Markdown",
     )
 
@@ -108,7 +188,7 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
     _history.pop(update.effective_chat.id, None)
-    await update.message.reply_text("🔄 Konversation zurückgesetzt.")
+    await update.message.reply_text("🔄 Zurückgesetzt — neues Fahrzeug?")
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
@@ -134,7 +214,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         image_b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
         caption = (
             update.message.caption
-            or "Analysiere alle sichtbaren Fehlercodes, Werte und Statusinformationen auf diesem Screenshot."
+            or "Analysiere alle sichtbaren Fehlercodes, Messwerte und Statusinformationen."
         )
         content = [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
