@@ -4,3 +4,5 @@ __pycache__/
 .venv/
 venv/
 .env
+# Diagnosedaten bleiben lokal (persönliche Fahrzeugdaten)
+data/diagnoses.json

@@ -29,6 +29,7 @@ from telegram.ext import (
 )
 
 from sources import lookup_dtc, nhtsa_recalls, nhtsa_complaints
+from database import save_session, load_all, search, format_entry
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -172,7 +173,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
     await update.message.reply_text(
-        "🔧 *OBD Diagnose Agent*\n\n"
+        "🔧 *KFZ Diagnose Agent*\n\n"
         "Schick mir Fahrzeug + Fehlercode(s):\n"
         "`BMW 3er G20 2021, P0300, U0100`\n\n"
         "Oder einen *Screenshot* deines OBD-Geräts.\n\n"
@@ -180,15 +181,66 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "• SAE-Standarddatenbank (lokal)\n"
         "• NHTSA Rückrufe & Kundenbeschwerden\n"
         "• Web (TSBs, Foren, herstellerspezifische Codes)\n\n"
-        "/reset — Neues Fahrzeug",
+        "/reset — Neues Fahrzeug (speichert aktuelle Diagnose)\n"
+        "/history — Letzte Diagnosen anzeigen\n"
+        "/suche BMW — Diagnosen nach Fahrzeug oder Code suchen",
         parse_mode="Markdown",
     )
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
-    _history.pop(update.effective_chat.id, None)
+    chat_id = update.effective_chat.id
+    history = _history.pop(chat_id, [])
+
+    if history:
+        await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        try:
+            entry = save_session(history, claude)
+            if entry:
+                vehicle = f"{entry.get('make', '')} {entry.get('model', '')}".strip() or "Fahrzeug"
+                codes   = ", ".join(entry.get("dtc_codes") or [])
+                saved_msg = f"💾 Diagnose gespeichert: *{vehicle}*" + (f" — `{codes}`" if codes else "")
+            else:
+                saved_msg = "💾 Diagnose gespeichert."
+        except Exception as e:
+            log.exception("Fehler beim Speichern der Diagnose")
+            saved_msg = f"⚠️ Speichern fehlgeschlagen: {e}"
+        await update.message.reply_text(saved_msg, parse_mode="Markdown")
+
     await update.message.reply_text("🔄 Zurückgesetzt — neues Fahrzeug?")
+
+
+async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Letzte Diagnosen anzeigen."""
+    if not is_allowed(update):
+        return
+    entries = load_all()[:5]
+    if not entries:
+        await update.message.reply_text("📂 Noch keine Diagnosen gespeichert.")
+        return
+    parts = [f"📂 *Letzte {len(entries)} Diagnosen:*\n"]
+    for e in entries:
+        parts.append(format_entry(e, show_summary=False))
+    await update.message.reply_text("\n\n".join(parts), parse_mode="Markdown")
+
+
+async def cmd_suche(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Diagnosen durchsuchen: /suche BMW  oder  /suche P0300"""
+    if not is_allowed(update):
+        return
+    query = update.message.text.removeprefix("/suche").strip()
+    if not query:
+        await update.message.reply_text("Verwendung: `/suche BMW` oder `/suche P0300`", parse_mode="Markdown")
+        return
+    results = search(query)[:5]
+    if not results:
+        await update.message.reply_text(f"🔍 Keine Diagnosen gefunden für: *{query}*", parse_mode="Markdown")
+        return
+    parts = [f"🔍 *{len(results)} Treffer für \"{query}\":*\n"]
+    for e in results:
+        parts.append(format_entry(e, show_summary=True))
+    await update.message.reply_text("\n\n".join(parts), parse_mode="Markdown")
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
@@ -235,8 +287,10 @@ def main() -> None:
         raise RuntimeError("ANTHROPIC_API_KEY nicht gesetzt")
 
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("reset",   cmd_reset))
+    app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("suche",   cmd_suche))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
 
