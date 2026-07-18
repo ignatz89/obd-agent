@@ -132,8 +132,9 @@ def get_diagnosis(chat_id: int, user_content) -> str:
 
     for _ in range(15):  # max 15 Tool-Runden
         resp = claude.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-5",
             max_tokens=2048,
+            thinking={"type": "disabled"},   # wie bisher ohne Thinking — Sonnet 5 hätte es sonst standardmäßig an
             system=SYSTEM_PROMPT,
             tools=TOOLS,
             messages=messages,
