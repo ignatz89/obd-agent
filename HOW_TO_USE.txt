@@ -1,0 +1,149 @@
+====================================================================
+  KFZ AGENT  -  How to Use
+====================================================================
+
+WHAT IT DOES
+------------
+Telegram-Bot für Fahrzeug-/OBD-Diagnose. Schick ihm einen Fehlercode
+(Text oder Screenshot vom Auslesegerät) und er:
+  1. Identifiziert das Fahrzeug (Hersteller, Modell, Baujahr, Motor)
+  2. Schlägt jeden Fehlercode in der lokalen SAE-Standarddatenbank nach
+  3. Fragt NHTSA (USA) nach Rückrufen und Kundenbeschwerden ab
+  4. Fragt die KBA-Rückrufdatenbank (Deutschland/EU) ab
+  5. Sucht online nach TSBs, Forenbeiträgen und herstellerspezifischen
+     Codes (motor-talk.de, TDIClub, Bimmerpost, ...)
+  6. Liefert eine strukturierte Diagnose mit Schweregrad (🔴/🟡/🟢),
+     wahrscheinlichsten Ursachen und nächsten Diagnoseschritten
+
+Zusätzlich: Reparaturanleitungen mit YouTube-Videos (/anleitung) und
+Fahrzeug-Infos per VIN oder HSN/TSN (/fahrzeug) — Stärken, Schwächen,
+Rückrufe, bekannte Probleme.
+
+
+REQUIREMENTS
+------------
+1. pip install -r requirements.txt
+   (anthropic, python-telegram-bot)
+2. Telegram Bot Token (@BotFather in Telegram, /newbot)
+3. Anthropic API-Key (https://console.anthropic.com)
+
+
+SETUP (einmalig)
+-----------------
+1. config.ini ausfüllen:
+
+   [telegram]
+   bot_token       = DEIN_BOT_TOKEN
+   allowed_chat_id = DEINE_CHAT_ID     (optional — leer = Bot antwortet jedem)
+
+   [anthropic]
+   api_key = DEIN_ANTHROPIC_KEY
+
+   Chat-ID herausfinden: @userinfobot in Telegram anschreiben, /start.
+
+2. Alternativ per Umgebungsvariable statt config.ini:
+   BOT_TOKEN, ANTHROPIC_API_KEY, ALLOWED_CHAT_ID
+   (Env-Variablen haben Vorrang vor config.ini)
+
+3. Bot starten:
+   py bot.py
+
+   Läuft per Long-Polling — der Prozess muss laufen, solange der Bot
+   erreichbar sein soll. Kein Server-Deployment vorhanden (Stand jetzt
+   nur lokal getestet/genutzt).
+
+
+COMMANDS
+--------
+/start
+  Kurzerklärung, was der Bot kann.
+
+/reset
+  Beendet die aktuelle Diagnosesession und speichert sie strukturiert
+  in data/diagnoses.json (Hersteller, Modell, Codes, Zusammenfassung).
+  Danach beginnt eine neue, leere Session.
+
+/history
+  Zeigt die letzten 5 gespeicherten Diagnosen.
+
+/suche <Begriff>
+  Durchsucht gespeicherte Diagnosen nach Hersteller, Modell, Fehlercode
+  oder Symptom.
+  Beispiel:  /suche BMW
+  Beispiel:  /suche P0300
+
+/anleitung [Fahrzeug/Code]
+  Reparaturanleitung zur aktuell laufenden Diagnose (YouTube-Videos +
+  eigene Schritt-für-Schritt-Anleitung mit Werkzeug, Sicherheitshinweisen,
+  Schwierigkeitsgrad). Auch ohne laufende Diagnose direkt nutzbar:
+  Beispiel:  /anleitung BMW 3er G20 2021 P0300
+
+/fahrzeug <VIN oder HSN/TSN>
+  Technische Eckdaten, Stärken/Schwächen, bekannte Probleme und
+  Rückrufe zu einem Fahrzeug/Motor.
+  Beispiel (VIN, 17-stellig):   /fahrzeug WBA12345678901234
+  Beispiel (HSN/TSN):           /fahrzeug 0005 ABC
+  (HSN/TSN steht im Fahrzeugschein, Feld 2.1/2.2)
+
+Text (ohne Command)
+  Fahrzeug + Fehlercode(s) direkt schicken:
+  Beispiel:  BMW 3er G20 2021, P0300, U0100
+
+Screenshot
+  Foto vom OBD-Auslesegerät oder der Diagnose-Software schicken —
+  Claude liest Codes, Messwerte und Statusanzeigen direkt vom Bild.
+
+
+DATENQUELLEN — WARUM NHTSA UND KBA
+------------------------------------
+Der Bot fragt für Rückrufe bewusst BEIDE Quellen ab:
+
+  NHTSA (USA)   — kostenlose API der US-Verkehrsbehörde, deckt den
+                  US-Markt ab (api.nhtsa.gov).
+  KBA (DE/EU)   — CSV-Export der deutschen Rückrufdatenbank
+                  (kba-online.de), deckt den deutschen/europäischen
+                  Markt ab. Wird lokal gecacht (data/kba_rueckrufe.csv)
+                  und automatisch alle 30 Tage neu heruntergeladen.
+
+Grund: Für ein in Deutschland gefahrenes Fahrzeug ist KBA meist die
+aussagekräftigere Quelle — aber viele Motoren/Plattformen werden
+konzernweit über mehrere Märkte hinweg verbaut (z. B. VW-Konzern-Motor
+in mehreren Marken, oder ein Modell das auch in den USA verkauft wird).
+Beide Quellen zusammen liefern ein vollständigeres Bild als eine allein.
+
+Weitere Quellen:
+  SAE-DTC-Datenbank  — lokale JSON-Datei (dtc_codes.json), keine API,
+                        offizielle Bezeichnungen für Standard-Fehlercodes
+                        (P/B/C/U-Codes).
+  NHTSA vPIC         — kostenlose API zur VIN-Dekodierung (auch für
+                        EU-Fahrzeuge über die Hersteller-WMI nutzbar,
+                        Details können bei Nicht-US-Fahrzeugen fehlen).
+  Websuche            — Claudes eingebautes web_search-Tool für TSBs,
+                        Forenbeiträge, herstellerspezifische Codes und
+                        YouTube-Reparaturvideos.
+
+
+CONFIGURATION (config.ini)
+----------------------------
+[telegram]
+  bot_token         Telegram Bot-Token von @BotFather
+  allowed_chat_id   Optional — beschränkt den Bot auf eine Chat-ID.
+                     Leer = Bot antwortet jedem, der ihn anschreibt.
+
+[anthropic]
+  api_key           Anthropic API-Key
+
+
+DATEN (data/, auto-generiert)
+--------------------------------
+  diagnoses.json       Alle gespeicherten Diagnosen/Anleitungen/
+                        Fahrzeug-Infos (persistente History).
+  kba_rueckrufe.csv    Gecachter KBA-Rückruf-Export, alle 30 Tage
+                        automatisch aktualisiert.
+
+Konversations-Verlauf selbst (der laufende Chat) ist NICHT persistent —
+er lebt nur im Speicher des laufenden Prozesses und geht bei einem
+Neustart des Bots verloren. Nur explizit per /reset gespeicherte
+Diagnosen sowie /anleitung- und /fahrzeug-Anfragen überstehen einen
+Neustart.
+====================================================================
