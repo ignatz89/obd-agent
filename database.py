@@ -1,19 +1,20 @@
 """
-Persistente Diagnose-Datenbank für den KFZ-Agenten.
+Persistente Datenbank für den KFZ-Agenten.
 
-Speichert jede abgeschlossene Diagnosesession als JSON-Eintrag in
-data/diagnoses.json. Beim /reset-Befehl wird die aktuelle Konversation
-per Claude Haiku in strukturierte Felder extrahiert und gespeichert.
+Speichert jede abgeschlossene Diagnosesession (per /reset, Konversation per Claude Haiku
+strukturiert extrahiert) sowie jede Einzelanfrage (/anleitung, /fahrzeug — sofort, ohne /reset)
+als JSON-Eintrag in data/diagnoses.json.
 
 Schema pro Eintrag:
   id            — Timestamp-basierte ID (z.B. 20260703-143022)
-  date          — Datum/Uhrzeit der Diagnose
+  date          — Datum/Uhrzeit
+  type          — "diagnose" | "anleitung" | "fahrzeug_info"
   make          — Fahrzeughersteller
   model         — Modell + Generation
   year          — Baujahr (int oder null)
   dtc_codes     — Liste der gefundenen DTC-Codes
-  symptoms      — Kurzbeschreibung der Symptome
-  summary       — 1-2 Satz Diagnose-Zusammenfassung
+  symptoms      — Kurzbeschreibung der Symptome / Anfrage
+  summary       — 1-2 Satz Zusammenfassung
   raw_messages  — vollständige Konversation (nur User+Assistent-Text)
 """
 
@@ -134,6 +135,7 @@ def save_session(history: list, client: anthropic.Anthropic) -> Optional[dict]:
     entry = {
         "id":           datetime.now().strftime("%Y%m%d-%H%M%S"),
         "date":         datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "type":         "diagnose",
         "make":         extracted.get("make")     or "",
         "model":        extracted.get("model")    or "",
         "year":         extracted.get("year")     or None,
@@ -143,6 +145,33 @@ def save_session(history: list, client: anthropic.Anthropic) -> Optional[dict]:
         "raw_messages": simple_messages,
     }
 
+    entries = _load()
+    entries.append(entry)
+    _save(entries)
+    return entry
+
+
+def log_interaction(
+    entry_type: str,
+    query: str,
+    reply: str,
+    make: str = "",
+    model: str = "",
+    year: Optional[int] = None,
+) -> dict:
+    """Speichert eine einzelne Anfrage (z.B. /anleitung, /fahrzeug) sofort — unabhängig von /reset."""
+    entry = {
+        "id":           datetime.now().strftime("%Y%m%d-%H%M%S"),
+        "date":         datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "type":         entry_type,
+        "make":         make or "",
+        "model":        model or "",
+        "year":         year,
+        "dtc_codes":    _find_dtc_codes(query),
+        "symptoms":     query[:300],
+        "summary":      reply[:300],
+        "raw_messages": [{"role": "user", "content": query}, {"role": "assistant", "content": reply}],
+    }
     entries = _load()
     entries.append(entry)
     _save(entries)
@@ -174,6 +203,9 @@ def search(query: str) -> list:
     return list(reversed(results))
 
 
+_TYPE_LABEL = {"diagnose": "Diagnose", "anleitung": "Anleitung", "fahrzeug_info": "Fahrzeug-Info"}
+
+
 def format_entry(entry: dict, show_summary: bool = True) -> str:
     """Formatiert einen Eintrag für die Telegram-Ausgabe."""
     make   = entry.get("make")  or "?"
@@ -183,10 +215,11 @@ def format_entry(entry: dict, show_summary: bool = True) -> str:
     date   = entry.get("date", "?")
     sympt  = entry.get("symptoms", "")[:200]
     summ   = entry.get("summary", "")[:300]
+    label  = _TYPE_LABEL.get(entry.get("type", "diagnose"), "Diagnose")
 
     vehicle = f"{make} {model}" + (f" ({year})" if year else "")
     lines = [
-        f"🚗 *{vehicle}*",
+        f"🚗 *{vehicle}* — {label}",
         f"📅 {date}",
         f"🔴 Codes: `{codes}`",
     ]

@@ -18,7 +18,9 @@ Commands:
 import base64
 import logging
 import os
+import re
 import configparser
+from datetime import datetime
 from pathlib import Path
 
 import anthropic
@@ -28,8 +30,8 @@ from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler, filters,
 )
 
-from sources import lookup_dtc, nhtsa_recalls, nhtsa_complaints
-from database import save_session, load_all, search, format_entry
+from sources import lookup_dtc, nhtsa_recalls, nhtsa_complaints, kba_recalls, decode_vin
+from database import save_session, load_all, search, format_entry, log_interaction
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -53,7 +55,7 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
 # ── Tools ─────────────────────────────────────────────────────────────────────
 TOOLS = [
-    {"type": "web_search_20250305", "name": "web_search", "max_uses": 5},
+    {"type": "web_search_20260209", "name": "web_search", "max_uses": 5},
     {
         "name": "lookup_dtc",
         "description": "SAE-Standard Fehlercode (DTC) in lokaler Datenbank nachschlagen. Gibt offizielle Bezeichnung zurück. Immer zuerst aufrufen bevor online gesucht wird.",
@@ -91,6 +93,19 @@ TOOLS = [
             "required": ["make", "model", "year"],
         },
     },
+    {
+        "name": "kba_recalls",
+        "description": "KBA-Rückrufe (Deutschland/EU) für ein Fahrzeug abrufen. Für Fahrzeuge im deutschen/europäischen Markt aussagekräftiger als NHTSA (USA). Immer zusätzlich zu nhtsa_recalls aufrufen.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "make":  {"type": "string",  "description": "Hersteller, z.B. BMW, Volkswagen, Mercedes-Benz"},
+                "model": {"type": "string",  "description": "Modell, z.B. 3er, Golf, X3 — wie im deutschen Markt üblich benannt"},
+                "year":  {"type": "integer", "description": "Baujahr (optional, grenzt auf Produktionszeitraum ein)"},
+            },
+            "required": ["make", "model"],
+        },
+    },
 ]
 
 # ── Konversations-History (pro Chat, in-memory) ───────────────────────────────
@@ -120,6 +135,9 @@ def _run_tool(name: str, inputs: dict) -> str:
         return nhtsa_recalls(inputs["make"], inputs["model"], int(inputs["year"]))
     if name == "nhtsa_complaints":
         return nhtsa_complaints(inputs["make"], inputs["model"], int(inputs["year"]))
+    if name == "kba_recalls":
+        year = int(inputs["year"]) if inputs.get("year") is not None else None
+        return kba_recalls(inputs["make"], inputs["model"], year)
     return f"Unbekanntes Tool: {name}"
 
 # ── Claude mit Tool-Loop ───────────────────────────────────────────────────────
@@ -161,6 +179,87 @@ def get_diagnosis(chat_id: int, user_content) -> str:
 
     return "⚠️ Analyse konnte nicht abgeschlossen werden (zu viele Tool-Runden)."
 
+def _repair_guide_request(extra: str) -> str:
+    """Baut die Anfrage für /anleitung. `extra` ist optional (Fahrzeug/Code direkt im Command)."""
+    intro = (
+        f"Fahrzeug/Problem: {extra}\n\nErstelle dafür eine Reparaturanleitung."
+        if extra else
+        "Erstelle jetzt eine Reparaturanleitung für die oben diagnostizierten Fehlercode(s)/das Fahrzeug."
+    )
+    return (
+        intro + "\n\n"
+        "1) Suche per Websuche 2-4 passende YouTube-Reparaturvideos (echte, funktionierende Links "
+        "mit Titel und Kanalname — keine erfundenen Links).\n"
+        "2) Schreibe zusätzlich eine eigene schriftliche Schritt-für-Schritt-Anleitung: benötigtes "
+        "Werkzeug, Sicherheitshinweise, konkrete Arbeitsschritte, geschätzter Schwierigkeitsgrad und Zeitaufwand.\n"
+        "3) Auch bei sicherheitskritischen Arbeiten (Bremsen, Lenkung, Airbag, Hochvolt/EV-Batterie) die "
+        "vollständige fachliche Anleitung geben — keine Werkstattverweisung, siehe System-Prompt."
+    )
+
+def _report_header(label: str, vehicle: str = "") -> str:
+    """Fester, von Python erzeugter Kopf für jeden Berichtstyp — Datum/Typ sollen nicht vom
+    Modell formuliert werden, damit das Format garantiert gleich bleibt."""
+    date_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    veh = f" — {vehicle}" if vehicle else ""
+    return f"🚗 {label}{veh}\n📅 {date_str}\n{'─' * 24}\n\n"
+
+
+_VIN_RE = re.compile(r"^[A-HJ-NPR-Z0-9]{17}$")  # I, O, Q sind in VINs nicht erlaubt
+
+def _looks_like_vin(s: str) -> bool:
+    return bool(_VIN_RE.fullmatch(s.strip().upper()))
+
+
+def _vehicle_info_request(raw_input: str) -> tuple[str, dict]:
+    """Baut die Anfrage für /fahrzeug. Gibt (Prompt, decoded-Dict) zurück — decoded ist leer bei HSN/TSN."""
+    compact = raw_input.replace(" ", "")
+    decoded: dict = {}
+
+    if _looks_like_vin(compact):
+        decoded = decode_vin(compact)
+        if decoded.get("error"):
+            intro = f"VIN {compact} — Dekodierung fehlgeschlagen ({decoded['error']}). Bitte per Websuche recherchieren."
+        else:
+            fields = {
+                "Hersteller":        decoded.get("make"),
+                "Modell":            decoded.get("model"),
+                "Baujahr":           decoded.get("year"),
+                "Ausstattungslinie": decoded.get("trim"),
+                "Motor":             decoded.get("engine_model"),
+                "Zylinder":          decoded.get("engine_cyl"),
+                "Hubraum (L)":       decoded.get("displacement_l"),
+                "Kraftstoff":        decoded.get("fuel_type"),
+                "Antrieb":           decoded.get("drive_type"),
+                "Karosserie":        decoded.get("body_class"),
+            }
+            lines = [f"{k}: {v}" for k, v in fields.items() if v]
+            intro = f"VIN {compact} per NHTSA vPIC dekodiert:\n" + "\n".join(lines)
+            err = decoded.get("error_text", "")
+            if err and not err.startswith("0 -"):
+                intro += f"\nHinweis: {err}"
+            intro += (
+                "\n\nHinweis: Modell-/Motordetails können bei Fahrzeugen, die nicht in den USA verkauft "
+                "wurden, unvollständig sein — bei Lücken per Websuche mit der VIN oder den bekannten "
+                "Feldern (Hersteller/Baujahr) ergänzen."
+            )
+    else:
+        intro = (
+            f"HSN/TSN: {raw_input}\n"
+            "Finde per Websuche heraus, um welches Fahrzeug es sich handelt (Hersteller, Modell, Motor, Baujahr)."
+        )
+
+    prompt = (
+        intro + "\n\n"
+        "Recherchiere und fasse zusammen:\n"
+        "1) Technische Eckdaten (Motor(en), Leistung, Baujahr/Facelift-Stände, Getriebevarianten)\n"
+        "2) Stärken und Schwächen dieses Modells/Motors laut Testberichten und Foren\n"
+        "3) Häufige/bekannte Probleme — nutze kba_recalls UND nhtsa_recalls für Rückrufe, zusätzlich "
+        "Websuche für bekannte Schwachstellen aus Foren/Testberichten. Motorprobleme betreffen oft "
+        "mehrere Modelle mit demselben Motor — das bei der Suche berücksichtigen.\n"
+        "4) Sonstige relevante Infos (z.B. Zuverlässigkeits-/TÜV-Report-Auffälligkeiten, Unterhaltskosten)"
+    )
+    return prompt, decoded
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 def is_allowed(update: Update) -> bool:
@@ -184,7 +283,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "• Web (TSBs, Foren, herstellerspezifische Codes)\n\n"
         "/reset — Neues Fahrzeug (speichert aktuelle Diagnose)\n"
         "/history — Letzte Diagnosen anzeigen\n"
-        "/suche BMW — Diagnosen nach Fahrzeug oder Code suchen",
+        "/suche BMW — Diagnosen nach Fahrzeug oder Code suchen\n"
+        "/anleitung — Reparaturanleitung (YouTube-Videos + Schritt-für-Schritt) zur aktuellen Diagnose\n"
+        "/fahrzeug VIN oder HSN TSN — Stärken/Schwächen, Rückrufe, bekannte Probleme zu Modell/Motor",
         parse_mode="Markdown",
     )
 
@@ -243,13 +344,81 @@ async def cmd_suche(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parts.append(format_entry(e, show_summary=True))
     await update.message.reply_text("\n\n".join(parts), parse_mode="Markdown")
 
+async def cmd_anleitung(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reparaturanleitung (YouTube-Links + schriftliche Anleitung) zur laufenden Diagnose,
+    oder direkt: /anleitung BMW 3er G20 2021 P0300"""
+    if not is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    args = update.message.text.removeprefix("/anleitung").strip()
+
+    if not args and not _get_history(chat_id):
+        await update.message.reply_text(
+            "Erst einen Fehlercode analysieren, dann `/anleitung` für die Reparaturanleitung dazu.\n"
+            "Oder direkt: `/anleitung BMW 3er G20 2021 P0300`",
+            parse_mode="Markdown",
+        )
+        return
+
+    await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    try:
+        body  = get_diagnosis(chat_id, _repair_guide_request(args))
+        reply = _report_header("Reparaturanleitung", args) + body
+        await update.message.reply_text(reply)
+        log_interaction("anleitung", query=args or "(aus laufender Diagnose)", reply=reply)
+    except Exception as e:
+        log.exception("Fehler bei Reparaturanleitung")
+        await update.message.reply_text(f"⚠️ Fehler: {e}")
+
+
+async def cmd_fahrzeug(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fahrzeug-/Motorinfos zu VIN oder HSN/TSN: Stärken/Schwächen, Rückrufe, bekannte Probleme.
+    /fahrzeug WBA12345678901234  oder  /fahrzeug 0005 ABC"""
+    if not is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    args = update.message.text.removeprefix("/fahrzeug").strip()
+
+    if not args:
+        await update.message.reply_text(
+            "Verwendung:\n"
+            "`/fahrzeug WBA12345678901234` — VIN (17-stellig)\n"
+            "`/fahrzeug 0005 ABC` — HSN/TSN aus dem Fahrzeugschein (Feld 2.1/2.2)",
+            parse_mode="Markdown",
+        )
+        return
+
+    await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    try:
+        prompt, decoded = _vehicle_info_request(args)
+        body    = get_diagnosis(chat_id, prompt)
+        vehicle = " ".join(v for v in (decoded.get("make"), decoded.get("model"), decoded.get("year")) if v)
+        reply   = _report_header("Fahrzeug-Info", vehicle or args) + body
+        await update.message.reply_text(reply)
+        year = None
+        if decoded.get("year"):
+            try:
+                year = int(decoded["year"])
+            except ValueError:
+                pass
+        log_interaction(
+            "fahrzeug_info", query=args, reply=reply,
+            make=decoded.get("make", ""), model=decoded.get("model", ""), year=year,
+        )
+    except Exception as e:
+        log.exception("Fehler bei Fahrzeug-Info")
+        await update.message.reply_text(f"⚠️ Fehler: {e}")
+
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
     chat_id = update.effective_chat.id
+    is_new_session = not _get_history(chat_id)
     await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     try:
         reply = get_diagnosis(chat_id, update.message.text.strip())
+        if is_new_session:
+            reply = _report_header("Diagnose") + reply
         await update.message.reply_text(reply)
     except Exception as e:
         log.exception("Fehler bei Claude-Anfrage")
@@ -259,6 +428,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
     chat_id = update.effective_chat.id
+    is_new_session = not _get_history(chat_id)
     await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     try:
         photo = update.message.photo[-1]
@@ -274,6 +444,8 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             {"type": "text", "text": caption},
         ]
         reply = get_diagnosis(chat_id, content)
+        if is_new_session:
+            reply = _report_header("Diagnose") + reply
         await update.message.reply_text(reply)
     except Exception as e:
         log.exception("Fehler bei Bildverarbeitung")
@@ -292,6 +464,8 @@ def main() -> None:
     app.add_handler(CommandHandler("reset",   cmd_reset))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("suche",   cmd_suche))
+    app.add_handler(CommandHandler("anleitung", cmd_anleitung))
+    app.add_handler(CommandHandler("fahrzeug", cmd_fahrzeug))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
 

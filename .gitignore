@@ -6,3 +6,5 @@ venv/
 .env
 # Diagnosedaten bleiben lokal (persönliche Fahrzeugdaten)
 data/diagnoses.json
+# KBA-Rückruf-CSV-Cache (3.4 MB, wird automatisch neu heruntergeladen)
+data/kba_rueckrufe.csv
